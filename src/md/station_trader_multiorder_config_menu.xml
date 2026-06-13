@@ -1,0 +1,337 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="VAS_StationTraderMultiorder_Config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="md.xsd">
+  <!--
+    Config state + Extension Options UI for Station Trader Multiorder. The
+    gameplay lives in aiscripts; it reads the player.entity.$vas_stm_* mirrors,
+    which are re-pushed from ModConfig on every load by InitDefaults.
+  -->
+  <cues>
+    <!-- Config STATE container. Defaults live in exactly one place: SeedDefaults. -->
+    <cue name="ModConfig" namespace="this">
+      <actions>
+        <run_actions ref="SeedDefaults"/>
+      </actions>
+    </cue>
+
+    <!--@doc
+        Idempotent defaults seeder. String-coercion null checks: explicit
+        false/0 must NOT be re-seeded. -->
+    <library name="SeedDefaults" purpose="run_actions">
+      <actions>
+        <set_value name="$defaults" exact="table[
+          $debugEnabled = false,
+          $enablePlayer = true,
+          $enableNpc = true,
+          $enableTraders = true,
+          $enableBuildStorageTraders = true,
+          $maxWaresPerTrip = 3,
+          $minCargoUsage = 40,
+          $maxExtraTrades = 5,
+          $extraTargetPct = 80,
+          $minLegPct = 5,
+          $dropUnfilledPrimary = false,
+        ]"/>
+        <do_for_each name="$key" in="$defaults.keys.list">
+          <do_if value="(@md.VAS_StationTraderMultiorder_Config.ModConfig.{$key} + '') == 'null'">
+            <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.{$key}" exact="$defaults.{$key}"/>
+          </do_if>
+        </do_for_each>
+      </actions>
+    </library>
+
+    <!-- event_universe_generated fires both at new-game start AND on every
+         savegame load (md.xsd), so it alone covers all sessions. Seeds defaults
+         and re-pushes all aiscript blackboard mirrors. -->
+    <cue name="InitDefaults" instantiate="true">
+      <conditions>
+        <event_universe_generated/>
+      </conditions>
+      <actions>
+        <run_actions ref="SeedDefaults"/>
+        <set_value name="player.entity.$vas_stm_debug_chance" exact="if md.VAS_StationTraderMultiorder_Config.ModConfig.$debugEnabled then 100 else 0"/>
+        <set_value name="player.entity.$vas_stm_enable_player" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$enablePlayer"/>
+        <set_value name="player.entity.$vas_stm_enable_npc" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$enableNpc"/>
+        <set_value name="player.entity.$vas_stm_enable_traders" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$enableTraders"/>
+        <set_value name="player.entity.$vas_stm_enable_build_storage_traders" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$enableBuildStorageTraders"/>
+        <set_value name="player.entity.$vas_stm_max_wares_per_trip" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$maxWaresPerTrip"/>
+        <set_value name="player.entity.$vas_stm_min_cargo_pct" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$minCargoUsage"/>
+        <set_value name="player.entity.$vas_stm_max_extra_trades" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$maxExtraTrades"/>
+        <set_value name="player.entity.$vas_stm_extra_target_pct" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$extraTargetPct"/>
+        <set_value name="player.entity.$vas_stm_min_leg_pct" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$minLegPct"/>
+        <set_value name="player.entity.$vas_stm_drop_unfilled_primary" exact="md.VAS_StationTraderMultiorder_Config.ModConfig.$dropUnfilledPrimary"/>
+      </actions>
+    </cue>
+
+    <cue name="StartSMO" instantiate="true">
+      <conditions>
+        <event_cue_signalled cue="md.Simple_Menu_Options.Reloaded"/>
+      </conditions>
+      <actions>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Register_Options_Menu" param="table[
+          $id = 'vas_stm_options_menu',
+          $columns = 3,
+          $title = {202606061,1},
+          $onOpen = BuildOptionsMenu,
+        ]"/>
+        <cancel_cue cue="this"/>
+      </actions>
+    </cue>
+
+    <cue name="BuildOptionsMenu" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Call_Table_Method" param="table[
+          $method = 'setColWidth',
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Call_Table_Method" param="table[
+          $method = 'setColWidth',
+          $col = 2,
+          $width = 250,
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_CheckBox" param="table[
+          $id = 'enablePlayer',
+          $checked = @md.VAS_StationTraderMultiorder_Config.ModConfig.$enablePlayer,
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+          $height = 'Helper.standardButtonHeight',
+          $onClick = OnOptionsCheckboxChanged,
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 2,
+          $text = {202606061,10},
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_CheckBox" param="table[
+          $id = 'enableNpc',
+          $checked = @md.VAS_StationTraderMultiorder_Config.ModConfig.$enableNpc,
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+          $height = 'Helper.standardButtonHeight',
+          $onClick = OnOptionsCheckboxChanged,
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 2,
+          $text = {202606061,11},
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_CheckBox" param="table[
+          $id = 'enableTraders',
+          $checked = @md.VAS_StationTraderMultiorder_Config.ModConfig.$enableTraders,
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+          $height = 'Helper.standardButtonHeight',
+          $onClick = OnOptionsCheckboxChanged,
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 2,
+          $text = {202606061,2},
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_CheckBox" param="table[
+          $id = 'enableBuildStorageTraders',
+          $checked = @md.VAS_StationTraderMultiorder_Config.ModConfig.$enableBuildStorageTraders,
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+          $height = 'Helper.standardButtonHeight',
+          $onClick = OnOptionsCheckboxChanged,
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 2,
+          $text = {202606061,7},
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 1,
+          $colSpan = 2,
+          $text = {202606061,3},
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Slider" param="table[
+          $col = 3,
+          $id = 'maxWaresPerTrip',
+          $echo = 'maxWaresPerTrip',
+          $height = 'Helper.slidercellMinHeight',
+          $min = 1,
+          $max = 7,
+          $step = 1,
+          $start = @md.VAS_StationTraderMultiorder_Config.ModConfig.$maxWaresPerTrip,
+          $onSliderCellConfirm = OnOptionsSliderChanged,
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 1,
+          $colSpan = 2,
+          $text = {202606061,4},
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Slider" param="table[
+          $col = 3,
+          $id = 'minCargoUsage',
+          $echo = 'minCargoUsage',
+          $height = 'Helper.slidercellMinHeight',
+          $min = 0,
+          $max = 100,
+          $step = 5,
+          $start = @md.VAS_StationTraderMultiorder_Config.ModConfig.$minCargoUsage,
+          $suffix = ' %',
+          $onSliderCellConfirm = OnOptionsSliderChanged,
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 1,
+          $colSpan = 2,
+          $text = {202606061,5},
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Slider" param="table[
+          $col = 3,
+          $id = 'maxExtraTrades',
+          $echo = 'maxExtraTrades',
+          $height = 'Helper.slidercellMinHeight',
+          $min = 0,
+          $max = 10,
+          $step = 1,
+          $start = @md.VAS_StationTraderMultiorder_Config.ModConfig.$maxExtraTrades,
+          $onSliderCellConfirm = OnOptionsSliderChanged,
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 1,
+          $colSpan = 2,
+          $text = {202606061,8},
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Slider" param="table[
+          $col = 3,
+          $id = 'extraTargetPct',
+          $echo = 'extraTargetPct',
+          $height = 'Helper.slidercellMinHeight',
+          $min = 0,
+          $max = 100,
+          $step = 5,
+          $start = @md.VAS_StationTraderMultiorder_Config.ModConfig.$extraTargetPct,
+          $suffix = ' %',
+          $onSliderCellConfirm = OnOptionsSliderChanged,
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 1,
+          $colSpan = 2,
+          $text = {202606061,9},
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Slider" param="table[
+          $col = 3,
+          $id = 'minLegPct',
+          $echo = 'minLegPct',
+          $height = 'Helper.slidercellMinHeight',
+          $min = 0,
+          $max = 50,
+          $step = 1,
+          $start = @md.VAS_StationTraderMultiorder_Config.ModConfig.$minLegPct,
+          $suffix = ' %',
+          $onSliderCellConfirm = OnOptionsSliderChanged,
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_CheckBox" param="table[
+          $id = 'dropUnfilledPrimary',
+          $checked = @md.VAS_StationTraderMultiorder_Config.ModConfig.$dropUnfilledPrimary,
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+          $height = 'Helper.standardButtonHeight',
+          $onClick = OnOptionsCheckboxChanged,
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 2,
+          $text = {202606061,12},
+        ]"/>
+
+        <signal_cue_instantly cue="md.Simple_Menu_API.Add_Row"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_CheckBox" param="table[
+          $id = 'debugEnabled',
+          $checked = @md.VAS_StationTraderMultiorder_Config.ModConfig.$debugEnabled,
+          $col = 1,
+          $width = 'Helper.standardButtonHeight',
+          $height = 'Helper.standardButtonHeight',
+          $onClick = OnOptionsCheckboxChanged,
+        ]"/>
+        <signal_cue_instantly cue="md.Simple_Menu_API.Make_Text" param="table[
+          $col = 2,
+          $text = {202606061,6},
+        ]"/>
+      </actions>
+    </cue>
+
+    <cue name="OnOptionsCheckboxChanged" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.{'$' + event.param.$id}" exact="event.param.$checked"/>
+        <do_if value="event.param.$id == 'debugEnabled'">
+          <do_if value="event.param.$checked">
+            <set_value name="player.entity.$vas_stm_debug_chance" exact="100"/>
+          </do_if>
+          <do_else>
+            <set_value name="player.entity.$vas_stm_debug_chance" exact="0"/>
+          </do_else>
+        </do_if>
+        <do_elseif value="event.param.$id == 'enablePlayer'">
+          <set_value name="player.entity.$vas_stm_enable_player" exact="event.param.$checked"/>
+        </do_elseif>
+        <do_elseif value="event.param.$id == 'enableNpc'">
+          <set_value name="player.entity.$vas_stm_enable_npc" exact="event.param.$checked"/>
+        </do_elseif>
+        <do_elseif value="event.param.$id == 'enableTraders'">
+          <set_value name="player.entity.$vas_stm_enable_traders" exact="event.param.$checked"/>
+        </do_elseif>
+        <do_elseif value="event.param.$id == 'enableBuildStorageTraders'">
+          <set_value name="player.entity.$vas_stm_enable_build_storage_traders" exact="event.param.$checked"/>
+        </do_elseif>
+        <do_elseif value="event.param.$id == 'dropUnfilledPrimary'">
+          <set_value name="player.entity.$vas_stm_drop_unfilled_primary" exact="event.param.$checked"/>
+        </do_elseif>
+        <cancel_cue cue="this"/>
+      </actions>
+    </cue>
+
+    <cue name="OnOptionsSliderChanged" instantiate="true">
+      <conditions>
+        <event_cue_signalled/>
+      </conditions>
+      <actions>
+        <do_if value="event.param.$echo == 'maxWaresPerTrip'">
+          <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.$maxWaresPerTrip" exact="event.param.$value"/>
+          <set_value name="player.entity.$vas_stm_max_wares_per_trip" exact="event.param.$value"/>
+        </do_if>
+        <do_elseif value="event.param.$echo == 'minCargoUsage'">
+          <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.$minCargoUsage" exact="event.param.$value"/>
+          <set_value name="player.entity.$vas_stm_min_cargo_pct" exact="event.param.$value"/>
+        </do_elseif>
+        <do_elseif value="event.param.$echo == 'maxExtraTrades'">
+          <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.$maxExtraTrades" exact="event.param.$value"/>
+          <set_value name="player.entity.$vas_stm_max_extra_trades" exact="event.param.$value"/>
+        </do_elseif>
+        <do_elseif value="event.param.$echo == 'extraTargetPct'">
+          <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.$extraTargetPct" exact="event.param.$value"/>
+          <set_value name="player.entity.$vas_stm_extra_target_pct" exact="event.param.$value"/>
+        </do_elseif>
+        <do_elseif value="event.param.$echo == 'minLegPct'">
+          <set_value name="md.VAS_StationTraderMultiorder_Config.ModConfig.$minLegPct" exact="event.param.$value"/>
+          <set_value name="player.entity.$vas_stm_min_leg_pct" exact="event.param.$value"/>
+        </do_elseif>
+        <cancel_cue cue="this"/>
+      </actions>
+    </cue>
+  </cues>
+</mdscript>

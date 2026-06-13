@@ -1,0 +1,629 @@
+<?xml version="1.0" encoding="utf-8"?>
+<diff>
+  <!-- ──────────────────────────────────────────────────────────────
+       Injection 1 — replace vanilla's remove_value($buyoffer_offeramount),
+       which sits right after the primary buy/sell amounts are resolved
+       ($performbuy / $performsell / $buyamount / $sellamount) and right
+       before the trade-order creation block.
+
+       We seed the per-leg order lists with the PRIMARY trade (so mod-off
+       is byte-for-byte vanilla), detect intent from the commander anchor,
+       then assemble extra same-direction trades.
+
+       Search strategy (cheap-first):
+         targets = [ primary's external station ] ++ [ in-range sectors, near→far ]
+         For each target, ONE multi-ware find returns every basket ware it
+         trades; we add the profitable ones until an early-return fill % is
+         reached. The first target is the primary's own station, so the
+         common "everything fills at one station" case never scans a sector.
+         The per-target early-return means we stop discovering new stations
+         as soon as the trip is full enough.
+
+       Order creation (injections 2 & 3) emits ALL sells then ALL buys;
+       "immediate" trade orders stack LIFO, so execution runs ALL buys then
+       ALL sells — each station visited once. The variable side of the route
+       is distance-sorted so the reversed execution visits the nearest first.
+
+       Variable glossary:
+          $vas_stm_buy_legs / $vas_stm_sell_legs
+            Queued trade legs. BUY legs use sell offers; SELL legs use buy offers.
+            Each leg stores only $offer/$amount/$station/$internal; the route-sort
+            derives distances live from $station.
+         $vas_stm_cmd
+           Commander station, or the station whose build storage is being served.
+         $vas_stm_mode
+           "buy" when the ship supplies commander demand; "sell" when it exports
+           commander wares to external demand; "none" when the trade shape is not
+           recognized.
+         $vas_stm_targets / $vas_stm_spaces / $vas_stm_tgt
+           Search targets. The primary trade station is tried first, then in-range
+           sectors sorted by gate distance.
+         $vas_stm_offers / $vas_stm_off / $vas_stm_cmd_off
+           Candidate external offers and the matching commander-side offer.
+         $vas_stm_wstate / $vas_stm_used_pairs
+           Per-ware commander-side state rows (remaining amount + aggregated leg), and
+           the (station,ware) pairs already sourced, so one station is never used twice
+           for the same ware across overlapping targets.
+         $vas_stm_cargo_capacity / $vas_stm_cargo_free / $vas_stm_remaining_volume
+           Cargo budget for adding extra wares to the current round trip.
+         $vas_stm_total_volume / $vas_stm_legvol / $vas_stm_cargo_pct
+           Planned cargo volume totals and fill percentage for debug and min-fill.
+         $vas_stm_max_extra / $vas_stm_max_wares / $vas_stm_target / $vas_stm_min_leg_pct
+           Player-configured caps and thresholds.
+         $vas_stm_extra_count / $vas_stm_wares_this_trip
+           Counters for extra trade legs and unique wares in the trip.
+         $vas_stm_debug_name
+           Debug file name with owner prefix: player_<idcode> or npc_<idcode>.
+       ────────────────────────────────────────────────────────────── -->
+  <replace sel="/aiscript/attention/actions/remove_value[@name='$buyoffer_offeramount']">
+    <remove_value name="$buyoffer_offeramount"/>
+
+    <!-- Order-creation lists. Each leg:
+         table[ $offer=<tradeoffer for create_trade_order>, $amount, $station, $internal ]
+         BUY leg $offer = a sell offer (ship buys from a seller);
+         SELL leg $offer = a buy offer (ship sells to a buyer).
+         $station is the leg's stop; the route-sort below derives all distances
+         live from it, so no per-leg distance is stored.
+         Seeded with the primary so the mod-off path equals vanilla. -->
+    <set_value name="$vas_stm_sell_legs" exact="[]"/>
+    <set_value name="$vas_stm_buy_legs" exact="[]"/>
+
+    <do_if value="$performsell">
+      <set_value name="$vas_stm_primary_sell_leg" exact="table[
+        $offer = $buyoffer, $amount = $sellamount, $station = $buyoffer.buyer, $internal = not $blacklist_overridesell?,
+      ]"/>
+      <append_to_list name="$vas_stm_sell_legs" exact="$vas_stm_primary_sell_leg"/>
+    </do_if>
+    <do_if value="$performbuy">
+      <set_value name="$vas_stm_primary_buy_leg" exact="table[
+        $offer = $selloffer, $amount = $buyamount, $station = $selloffer.seller, $internal = not $blacklist_overridebuy?,
+      ]"/>
+      <append_to_list name="$vas_stm_buy_legs" exact="$vas_stm_primary_buy_leg"/>
+    </do_if>
+
+    <!-- Guard: mod on for this assignment, station subordinate, full round trip. -->
+    <do_if value="this.assignedcontrolled.commander
+                and ((this.assignedcontrolled.owner == faction.player and @player.entity.$vas_stm_enable_player) or (this.assignedcontrolled.owner != faction.player and @player.entity.$vas_stm_enable_npc))
+                and ((this.assignedcontrolled.assignment == assignment.trade and @player.entity.$vas_stm_enable_traders) or (this.assignedcontrolled.assignment == assignment.tradeforbuildstorage and @player.entity.$vas_stm_enable_build_storage_traders))
+                and $performsell
+                and $performbuy">
+
+      <set_value name="$vas_stm_cmd" exact="this.assignedcontrolled.commander"/>
+
+      <!-- Intent: which endpoint is the commander?
+           buy-for-station  → commander is the BUYER; sources vary.
+           sell-for-station → commander is the SELLER; destinations vary. -->
+      <set_value name="$vas_stm_mode" exact="'none'"/>
+      <do_if value="$buyoffer.buyer == $vas_stm_cmd or (@$vas_stm_cmd.buildstorage and $buyoffer.buyer == $vas_stm_cmd.buildstorage)">
+        <set_value name="$vas_stm_mode" exact="'buy'"/>
+      </do_if>
+      <do_elseif value="$selloffer.seller == $vas_stm_cmd">
+        <set_value name="$vas_stm_mode" exact="'sell'"/>
+      </do_elseif>
+
+      <!-- Cargo budget -->
+      <set_value name="$vas_stm_cargo_capacity" exact="this.assignedcontrolled.cargo.capacity.container"/>
+      <do_if value="not $vas_stm_cargo_capacity">
+        <set_value name="$vas_stm_cargo_capacity" exact="this.assignedcontrolled.cargo.capacity.universal"/>
+      </do_if>
+      <set_value name="$vas_stm_cargo_free" exact="this.assignedcontrolled.cargo.free.container"/>
+      <do_if value="not $vas_stm_cargo_free">
+        <set_value name="$vas_stm_cargo_free" exact="this.assignedcontrolled.cargo.free.universal"/>
+      </do_if>
+      <set_value name="$vas_stm_remaining_volume" exact="[$vas_stm_cargo_free, $vas_stm_cargo_capacity].min"/>
+      <set_value name="$vas_stm_total_volume" exact="$buyamount * $selloffer.ware.volume"/>
+      <set_value name="$vas_stm_remaining_volume" exact="[$vas_stm_remaining_volume - $vas_stm_total_volume, 0].max"/>
+      <set_value name="$vas_stm_wares_this_trip" exact="1"/>
+      <set_value name="$vas_stm_extra_count" exact="0"/>
+      <set_value name="$vas_stm_cargo_pct" exact="0"/>
+      <do_if value="$vas_stm_cargo_capacity gt 0">
+        <set_value name="$vas_stm_cargo_pct" exact="($vas_stm_total_volume * 100) / $vas_stm_cargo_capacity"/>
+      </do_if>
+
+      <!-- Config mirrors seeded by station_trader_multiorder_config_menu.xml. -->
+      <set_value name="$vas_stm_max_extra" exact="player.entity.$vas_stm_max_extra_trades"/>
+      <set_value name="$vas_stm_max_wares" exact="player.entity.$vas_stm_max_wares_per_trip"/>
+      <!-- Early-return fill target: stop adding extras once the trip reaches this %.
+           0 means "no early stop" (fill until caps / cargo). -->
+      <set_value name="$vas_stm_target" exact="player.entity.$vas_stm_extra_target_pct"/>
+      <!-- Per-extra floor: reject an extra leg smaller than this % of capacity. -->
+      <set_value name="$vas_stm_min_leg_pct" exact="player.entity.$vas_stm_min_leg_pct"/>
+
+      <!-- One commander-side leg per ware; variable external legs may repeat. -->
+      <set_value name="$vas_stm_wstate" exact="[]"/>
+      <set_value name="$vas_stm_used_pairs" exact="[]"/>
+      <set_value name="$vas_stm_debug_name" exact="(if this.assignedcontrolled.owner == faction.player then 'player_' else 'npc_') + this.assignedcontrolled.idcode"/>
+
+      <debug_to_file chance="@player.entity.$vas_stm_debug_chance" name="$vas_stm_debug_name" directory="'VAS_StationTraderMultiorder'"
+        text="'mode=%s. Primary %s x%s, %s%% fill. target %s%%, minleg %s%%, maxextra %s, maxwares %s.'.[$vas_stm_mode, $selloffer.ware, $buyamount, $vas_stm_cargo_pct, $vas_stm_target, $vas_stm_min_leg_pct, $vas_stm_max_extra, $vas_stm_max_wares]" append="true"/>
+
+      <do_if value="$vas_stm_mode != 'none'">
+        <do_if value="$vas_stm_mode == 'buy'">
+          <append_to_list name="$vas_stm_wstate" exact="table[
+            $ware = $selloffer.ware,
+            $remaining = [($buyoffer.offeramount.{this.assignedcontrolled} - $sellamount), 0].max,
+            $cmdleg = $vas_stm_primary_sell_leg,
+          ]"/>
+          <append_to_list name="$vas_stm_used_pairs" exact="table[$station = $selloffer.seller, $ware = $selloffer.ware]"/>
+        </do_if>
+        <do_else>
+          <append_to_list name="$vas_stm_wstate" exact="table[
+            $ware = $selloffer.ware,
+            $remaining = [($selloffer.offeramount.{this.assignedcontrolled} - $buyamount), 0].max,
+            $cmdleg = $vas_stm_primary_buy_leg,
+          ]"/>
+          <append_to_list name="$vas_stm_used_pairs" exact="table[$station = $buyoffer.buyer, $ware = $selloffer.ware]"/>
+        </do_else>
+
+        <!-- Build the ordered target list: primary's own station first (no
+             sector scan), then the in-range sectors sorted nearest-first.
+             Seed the list with the station, then append each sector element
+             (X4 has no list-concatenation operator; appending a whole list
+             would nest it). -->
+        <do_if value="$vas_stm_mode == 'buy'">
+          <set_value name="$vas_stm_spaces" exact="$buyspaces.clone"/>
+          <set_value name="$vas_stm_targets" exact="[$selloffer.seller]"/>
+        </do_if>
+        <do_else>
+          <set_value name="$vas_stm_spaces" exact="$sellspaces.clone"/>
+          <set_value name="$vas_stm_targets" exact="[$buyoffer.buyer]"/>
+        </do_else>
+        <do_if value="$vas_stm_spaces.count gt 1">
+          <do_if value="$vas_stm_mode == 'buy'">
+            <sort_list list="$vas_stm_spaces" sortbygatedistanceto="this.assignedcontrolled"/>
+          </do_if>
+          <do_else>
+            <sort_list list="$vas_stm_spaces" sortbygatedistanceto="$vas_stm_cmd"/>
+          </do_else>
+        </do_if>
+        <do_all exact="$vas_stm_spaces.count" counter="$vas_stm_szi">
+          <append_to_list name="$vas_stm_targets" exact="$vas_stm_spaces.{$vas_stm_szi}"/>
+        </do_all>
+
+        <do_all exact="$vas_stm_targets.count" counter="$vas_stm_ti">
+          <!-- Per-target early return: stop once full enough or caps hit. -->
+          <do_if value="$vas_stm_cargo_pct lt $vas_stm_target
+                      and $vas_stm_extra_count lt $vas_stm_max_extra
+                      and $vas_stm_remaining_volume gt 0">
+            <set_value name="$vas_stm_tgt" exact="$vas_stm_targets.{$vas_stm_ti}"/>
+
+            <!-- ─────────── buy-for-station ─────────── -->
+            <do_if value="$vas_stm_mode == 'buy'">
+              <!-- Same restrictions vanilla's trade.find.commander applies to its
+                   seller search: honour the trader's 'buy from' rule ($buyfromfactions),
+                   the per-station object-activity blacklist, and known offers only. -->
+              <do_if value="$vas_stm_tgt.isclass.sector">
+                <find_sell_offer result="$vas_stm_offers" tradepartner="this.assignedcontrolled" buyer="$vas_stm_cmd" wares="$warebasket" space="$vas_stm_tgt" multiple="true">
+                  <match_seller owner="$buyfromfactions" negateownerfilter="not $buyfromfactions.count" tradesknownto="this.assignedcontrolled.owner">
+                    <match_use_blacklist group="$blacklistgroup" type="blacklisttype.objectactivity" object="this.assignedcontrolled"/>
+                  </match_seller>
+                </find_sell_offer>
+              </do_if>
+              <do_else>
+                <find_sell_offer result="$vas_stm_offers" tradepartner="this.assignedcontrolled" buyer="$vas_stm_cmd" wares="$warebasket" seller="$vas_stm_tgt" multiple="true">
+                  <match_seller owner="$buyfromfactions" negateownerfilter="not $buyfromfactions.count" tradesknownto="this.assignedcontrolled.owner">
+                    <match_use_blacklist group="$blacklistgroup" type="blacklisttype.objectactivity" object="this.assignedcontrolled"/>
+                  </match_seller>
+                </find_sell_offer>
+              </do_else>
+
+              <do_all exact="$vas_stm_offers.count" counter="$vas_stm_oi">
+                <do_if value="$vas_stm_cargo_pct lt $vas_stm_target and $vas_stm_extra_count lt $vas_stm_max_extra and $vas_stm_remaining_volume gt 0">
+                  <set_value name="$vas_stm_off" exact="$vas_stm_offers.{$vas_stm_oi}"/>
+                  <set_value name="$vas_stm_ware" exact="$vas_stm_off.ware"/>
+                  <do_if value="$vas_stm_off.available and $vas_stm_off.offeramount.{this.assignedcontrolled} gt 0
+                              and this.assignedcontrolled.cargo.{$vas_stm_ware}.max gt 0
+                              and this.assignedcontrolled.gatedistance.{$vas_stm_off.seller} ge 0">
+                    <remove_value name="$vas_stm_state"/>
+                    <set_value name="$vas_stm_new_ware" exact="false"/>
+                    <set_value name="$vas_stm_pair_used" exact="false"/>
+                    <do_all exact="$vas_stm_wstate.count" counter="$vas_stm_wi">
+                      <do_if value="$vas_stm_wstate.{$vas_stm_wi}.$ware == $vas_stm_ware">
+                        <set_value name="$vas_stm_state" exact="$vas_stm_wstate.{$vas_stm_wi}"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <do_all exact="$vas_stm_used_pairs.count" counter="$vas_stm_pi">
+                      <do_if value="$vas_stm_used_pairs.{$vas_stm_pi}.$ware == $vas_stm_ware and $vas_stm_used_pairs.{$vas_stm_pi}.$station == $vas_stm_off.seller">
+                        <set_value name="$vas_stm_pair_used" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <find_buy_offer result="$vas_stm_cmd_off" tradepartner="this.assignedcontrolled" buyer="$vas_stm_cmd" wares="$vas_stm_ware"/>
+                    <!-- Honour the commander buy offer's own faction restriction
+                         (player setting "source this ware only from faction X"),
+                         exactly as vanilla's trade.find.commander does. -->
+                    <do_if value="not $vas_stm_pair_used
+                                and (@$vas_stm_state or $vas_stm_wares_this_trip lt $vas_stm_max_wares)
+                                and $vas_stm_cmd_off.available and $vas_stm_cmd_off.offeramount.{this.assignedcontrolled} gt 0
+                                and (not $vas_stm_cmd_off.restriction.factions.count
+                                     or (if $vas_stm_cmd_off.restriction.inverted
+                                           then not $vas_stm_cmd_off.restriction.factions.indexof.{$vas_stm_off.seller.owner}
+                                           else $vas_stm_cmd_off.restriction.factions.indexof.{$vas_stm_off.seller.owner}))">
+                      <do_if value="not @$vas_stm_state">
+                        <set_value name="$vas_stm_new_ware" exact="true"/>
+                        <set_value name="$vas_stm_cmd_leg" exact="table[$offer=$vas_stm_cmd_off, $amount=0, $station=$vas_stm_cmd, $internal= not $blacklist_overridesell?,]"/>
+                        <set_value name="$vas_stm_state" exact="table[$ware=$vas_stm_ware, $remaining=$vas_stm_cmd_off.offeramount.{this.assignedcontrolled}, $cmdleg=$vas_stm_cmd_leg,]"/>
+                      </do_if>
+                      <set_value name="$vas_stm_ba" exact="$vas_stm_off.offeramount.{this.assignedcontrolled}"/>
+                      <clamp_trade_amount trade="$vas_stm_off" amount="$vas_stm_ba" buyer="this.assignedcontrolled" seller="$vas_stm_off.seller" result="$vas_stm_clamped"/>
+                      <set_value name="$vas_stm_ba" exact="[[[[$vas_stm_ba, $vas_stm_clamped, this.assignedcontrolled.cargo.{$vas_stm_ware}.free].min, $vas_stm_state.$remaining].min, ($vas_stm_remaining_volume / $vas_stm_ware.volume)i].min, 0].max"/>
+                      <set_value name="$vas_stm_legvol" exact="$vas_stm_ba * $vas_stm_ware.volume"/>
+                      <do_if value="$vas_stm_ba gt 0 and $vas_stm_legvol ge (($vas_stm_min_leg_pct * $vas_stm_cargo_capacity) / 100)">
+                        <set_value name="$vas_stm_sa" exact="$vas_stm_ba"/>
+                        <do_if value="$vas_stm_sa gt 0 and ($vas_stm_cmd_off.unitprice * $vas_stm_sa) gt ($vas_stm_off.unitprice * $vas_stm_ba)">
+                          <do_if value="$vas_stm_new_ware">
+                            <append_to_list name="$vas_stm_wstate" exact="$vas_stm_state"/>
+                            <append_to_list name="$vas_stm_sell_legs" exact="$vas_stm_state.$cmdleg"/>
+                          </do_if>
+                          <append_to_list name="$vas_stm_buy_legs" exact="table[$offer=$vas_stm_off, $amount=$vas_stm_ba, $station=$vas_stm_off.seller, $internal= not $blacklist_overridebuy?,]"/>
+                          <set_value name="$vas_stm_state.$cmdleg.$amount" exact="$vas_stm_state.$cmdleg.$amount + $vas_stm_sa"/>
+                          <set_value name="$vas_stm_state.$remaining" exact="[$vas_stm_state.$remaining - $vas_stm_sa, 0].max"/>
+                          <append_to_list name="$vas_stm_used_pairs" exact="table[$station = $vas_stm_off.seller, $ware = $vas_stm_ware]"/>
+                          <set_value name="$vas_stm_total_volume" exact="$vas_stm_total_volume + $vas_stm_legvol"/>
+                          <set_value name="$vas_stm_remaining_volume" exact="[$vas_stm_remaining_volume - $vas_stm_legvol, 0].max"/>
+                          <do_if value="$vas_stm_new_ware">
+                            <set_value name="$vas_stm_wares_this_trip" exact="$vas_stm_wares_this_trip + 1"/>
+                          </do_if>
+                          <set_value name="$vas_stm_extra_count" exact="$vas_stm_extra_count + 1"/>
+                          <do_if value="$vas_stm_cargo_capacity gt 0">
+                            <set_value name="$vas_stm_cargo_pct" exact="($vas_stm_total_volume * 100) / $vas_stm_cargo_capacity"/>
+                          </do_if>
+                          <debug_to_file chance="@player.entity.$vas_stm_debug_chance" name="$vas_stm_debug_name" directory="'VAS_StationTraderMultiorder'"
+                            text="'+buy %s x%s from %s (%s m3, %s%%).'.[$vas_stm_ware, $vas_stm_ba, $vas_stm_off.seller.knownname, $vas_stm_legvol, $vas_stm_cargo_pct]" append="true"/>
+                        </do_if>
+                      </do_if>
+                      <remove_value name="$vas_stm_cmd_off"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_if>
+
+            <!-- ─────────── sell-for-station ─────────── -->
+            <do_elseif value="$vas_stm_mode == 'sell'">
+              <!-- Same restrictions vanilla's trade.find.commander applies to its
+                   buyer search: honour the trader's 'sell to' rule ($selltofactions),
+                   the per-station object-activity blacklist, and known offers only. -->
+              <do_if value="$vas_stm_tgt.isclass.sector">
+                <find_buy_offer result="$vas_stm_offers" tradepartner="this.assignedcontrolled" seller="$vas_stm_cmd" wares="$warebasket" space="$vas_stm_tgt" multiple="true">
+                  <match_buyer owner="$selltofactions" negateownerfilter="not $selltofactions.count" tradesknownto="this.assignedcontrolled.owner">
+                    <match_use_blacklist group="$blacklistgroup" type="blacklisttype.objectactivity" object="this.assignedcontrolled"/>
+                  </match_buyer>
+                </find_buy_offer>
+              </do_if>
+              <do_else>
+                <find_buy_offer result="$vas_stm_offers" tradepartner="this.assignedcontrolled" seller="$vas_stm_cmd" wares="$warebasket" buyer="$vas_stm_tgt" multiple="true">
+                  <match_buyer owner="$selltofactions" negateownerfilter="not $selltofactions.count" tradesknownto="this.assignedcontrolled.owner">
+                    <match_use_blacklist group="$blacklistgroup" type="blacklisttype.objectactivity" object="this.assignedcontrolled"/>
+                  </match_buyer>
+                </find_buy_offer>
+              </do_else>
+
+              <do_all exact="$vas_stm_offers.count" counter="$vas_stm_oi">
+                <do_if value="$vas_stm_cargo_pct lt $vas_stm_target and $vas_stm_extra_count lt $vas_stm_max_extra and $vas_stm_remaining_volume gt 0">
+                  <set_value name="$vas_stm_off" exact="$vas_stm_offers.{$vas_stm_oi}"/>
+                  <set_value name="$vas_stm_ware" exact="$vas_stm_off.ware"/>
+                  <do_if value="$vas_stm_off.available and $vas_stm_off.offeramount.{this.assignedcontrolled} gt 0
+                              and this.assignedcontrolled.cargo.{$vas_stm_ware}.max gt 0
+                              and $vas_stm_cmd.gatedistance.{$vas_stm_off.buyer} ge 0">
+                    <remove_value name="$vas_stm_state"/>
+                    <set_value name="$vas_stm_new_ware" exact="false"/>
+                    <set_value name="$vas_stm_pair_used" exact="false"/>
+                    <do_all exact="$vas_stm_wstate.count" counter="$vas_stm_wi">
+                      <do_if value="$vas_stm_wstate.{$vas_stm_wi}.$ware == $vas_stm_ware">
+                        <set_value name="$vas_stm_state" exact="$vas_stm_wstate.{$vas_stm_wi}"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <do_all exact="$vas_stm_used_pairs.count" counter="$vas_stm_pi">
+                      <do_if value="$vas_stm_used_pairs.{$vas_stm_pi}.$ware == $vas_stm_ware and $vas_stm_used_pairs.{$vas_stm_pi}.$station == $vas_stm_off.buyer">
+                        <set_value name="$vas_stm_pair_used" exact="true"/>
+                        <break/>
+                      </do_if>
+                    </do_all>
+                    <find_sell_offer result="$vas_stm_cmd_off" tradepartner="this.assignedcontrolled" seller="$vas_stm_cmd" wares="$vas_stm_ware"/>
+                    <!-- Honour the commander sell offer's own faction restriction
+                         (player setting "export this ware only to faction X"),
+                         exactly as vanilla's trade.find.commander does. -->
+                    <do_if value="not $vas_stm_pair_used
+                                and (@$vas_stm_state or $vas_stm_wares_this_trip lt $vas_stm_max_wares)
+                                and $vas_stm_cmd_off.available and $vas_stm_cmd_off.offeramount.{this.assignedcontrolled} gt 0
+                                and (not $vas_stm_cmd_off.restriction.factions.count
+                                     or (if $vas_stm_cmd_off.restriction.inverted
+                                           then not $vas_stm_cmd_off.restriction.factions.indexof.{$vas_stm_off.buyer.owner}
+                                           else $vas_stm_cmd_off.restriction.factions.indexof.{$vas_stm_off.buyer.owner}))">
+                      <do_if value="not @$vas_stm_state">
+                        <set_value name="$vas_stm_new_ware" exact="true"/>
+                        <set_value name="$vas_stm_cmd_leg" exact="table[$offer=$vas_stm_cmd_off, $amount=0, $station=$vas_stm_cmd, $internal= not $blacklist_overridebuy?,]"/>
+                        <set_value name="$vas_stm_state" exact="table[$ware=$vas_stm_ware, $remaining=$vas_stm_cmd_off.offeramount.{this.assignedcontrolled}, $cmdleg=$vas_stm_cmd_leg,]"/>
+                      </do_if>
+                      <set_value name="$vas_stm_ba" exact="$vas_stm_cmd_off.offeramount.{this.assignedcontrolled}"/>
+                      <clamp_trade_amount trade="$vas_stm_cmd_off" amount="$vas_stm_ba" buyer="this.assignedcontrolled" seller="$vas_stm_cmd_off.seller" result="$vas_stm_clamped"/>
+                      <!-- Clamp to the external BUYER's actual demand BEFORE the min-leg
+                           floor, so the floor measures the real (buyer-limited) leg, not
+                           the commander's large sell offer. Without this, a buyer wanting
+                           only a handful of units slips past the floor. -->
+                      <set_value name="$vas_stm_ba" exact="[[[[[$vas_stm_ba, $vas_stm_off.offeramount.{this.assignedcontrolled}].min, $vas_stm_clamped, this.assignedcontrolled.cargo.{$vas_stm_ware}.free].min, $vas_stm_state.$remaining].min, ($vas_stm_remaining_volume / $vas_stm_ware.volume)i].min, 0].max"/>
+                      <set_value name="$vas_stm_legvol" exact="$vas_stm_ba * $vas_stm_ware.volume"/>
+                      <do_if value="$vas_stm_ba gt 0 and $vas_stm_legvol ge (($vas_stm_min_leg_pct * $vas_stm_cargo_capacity) / 100)">
+                        <set_value name="$vas_stm_sa" exact="[[$vas_stm_ba, $vas_stm_off.offeramount.{this.assignedcontrolled}].min, 0].max"/>
+                        <do_if value="$vas_stm_sa gt 0 and ($vas_stm_off.unitprice * $vas_stm_sa) gt ($vas_stm_cmd_off.unitprice * $vas_stm_sa)">
+                          <set_value name="$vas_stm_ba" exact="$vas_stm_sa"/>
+                          <set_value name="$vas_stm_legvol" exact="$vas_stm_ba * $vas_stm_ware.volume"/>
+                          <do_if value="$vas_stm_new_ware">
+                            <append_to_list name="$vas_stm_wstate" exact="$vas_stm_state"/>
+                            <append_to_list name="$vas_stm_buy_legs" exact="$vas_stm_state.$cmdleg"/>
+                          </do_if>
+                          <set_value name="$vas_stm_state.$cmdleg.$amount" exact="$vas_stm_state.$cmdleg.$amount + $vas_stm_ba"/>
+                          <set_value name="$vas_stm_state.$remaining" exact="[$vas_stm_state.$remaining - $vas_stm_ba, 0].max"/>
+                          <append_to_list name="$vas_stm_sell_legs" exact="table[$offer=$vas_stm_off, $amount=$vas_stm_sa, $station=$vas_stm_off.buyer, $internal= not $blacklist_overridesell?,]"/>
+                          <append_to_list name="$vas_stm_used_pairs" exact="table[$station = $vas_stm_off.buyer, $ware = $vas_stm_ware]"/>
+                          <set_value name="$vas_stm_total_volume" exact="$vas_stm_total_volume + $vas_stm_legvol"/>
+                          <set_value name="$vas_stm_remaining_volume" exact="[$vas_stm_remaining_volume - $vas_stm_legvol, 0].max"/>
+                          <do_if value="$vas_stm_new_ware">
+                            <set_value name="$vas_stm_wares_this_trip" exact="$vas_stm_wares_this_trip + 1"/>
+                          </do_if>
+                          <set_value name="$vas_stm_extra_count" exact="$vas_stm_extra_count + 1"/>
+                          <do_if value="$vas_stm_cargo_capacity gt 0">
+                            <set_value name="$vas_stm_cargo_pct" exact="($vas_stm_total_volume * 100) / $vas_stm_cargo_capacity"/>
+                          </do_if>
+                          <debug_to_file chance="@player.entity.$vas_stm_debug_chance" name="$vas_stm_debug_name" directory="'VAS_StationTraderMultiorder'"
+                            text="'+sell %s x%s to %s (%s m3, %s%%).'.[$vas_stm_ware, $vas_stm_sa, $vas_stm_off.buyer.knownname, $vas_stm_legvol, $vas_stm_cargo_pct]" append="true"/>
+                        </do_if>
+                      </do_if>
+                      <remove_value name="$vas_stm_cmd_off"/>
+                    </do_if>
+                  </do_if>
+                </do_if>
+              </do_all>
+            </do_elseif>
+
+            <remove_value name="$vas_stm_offers"/>
+            <remove_value name="$vas_stm_off"/>
+            <remove_value name="$vas_stm_ware"/>
+          </do_if>
+        </do_all>
+
+        <remove_value name="$vas_stm_targets"/>
+        <remove_value name="$vas_stm_spaces"/>
+        <remove_value name="$vas_stm_tgt"/>
+      </do_if>
+
+      <!-- ═══ Drop underfilled vanilla (primary) leg — opt-in ═══
+           The primary trade is seeded before extras and is normally exempt from
+           the per-leg floor (so mod-off equals vanilla). With this enabled, a
+           primary whose variable-side leg is below $vas_stm_min_leg_pct is removed
+           like any extra. Its PAIRED commander leg is decremented by the same
+           amount so buy/sell stay balanced — otherwise the ship would carry the
+           unsold remainder forever. A commander leg that drains to zero (its only
+           ware was dropped) is removed too, so no zero-amount order is emitted.
+           Build-storage supply is exempt: a genuinely small build demand must not
+           be starved. Extras already cleared the floor at insertion, so in practice
+           only the primary is ever dropped here; written as a general per-leg pass
+           for symmetry across buy/sell. Cargo totals are recomputed afterward so
+           the min-cargo gate below judges the trimmed trip. -->
+      <do_if value="@player.entity.$vas_stm_drop_unfilled_primary
+                  and $vas_stm_mode != 'none'
+                  and this.assignedcontrolled.assignment != assignment.tradeforbuildstorage
+                  and $vas_stm_min_leg_pct gt 0">
+        <set_value name="$vas_stm_floor_vol" exact="($vas_stm_min_leg_pct * $vas_stm_cargo_capacity) / 100"/>
+        <!-- Variable side = the legs that vary (buy mode: sources; sell mode:
+             destinations). Commander side = the accumulator legs to rebalance.
+             These are references to the real lists; commander-leg amounts are
+             mutated in place. -->
+        <set_value name="$vas_stm_var_legs" exact="if $vas_stm_mode == 'buy' then $vas_stm_buy_legs else $vas_stm_sell_legs"/>
+        <set_value name="$vas_stm_comm_legs" exact="if $vas_stm_mode == 'buy' then $vas_stm_sell_legs else $vas_stm_buy_legs"/>
+        <set_value name="$vas_stm_kept_legs" exact="[]"/>
+        <do_all exact="$vas_stm_var_legs.count" counter="$vas_stm_ci">
+          <set_value name="$vas_stm_clean_leg" exact="$vas_stm_var_legs.{$vas_stm_ci}"/>
+          <set_value name="$vas_stm_clean_vol" exact="$vas_stm_clean_leg.$amount * $vas_stm_clean_leg.$offer.ware.volume"/>
+          <do_if value="$vas_stm_clean_vol ge $vas_stm_floor_vol">
+            <append_to_list name="$vas_stm_kept_legs" exact="$vas_stm_clean_leg"/>
+          </do_if>
+          <do_else>
+            <!-- Rebalance the matching commander leg (same ware) and the cargo total. -->
+            <do_all exact="$vas_stm_comm_legs.count" counter="$vas_stm_cj">
+              <do_if value="$vas_stm_comm_legs.{$vas_stm_cj}.$offer.ware == $vas_stm_clean_leg.$offer.ware">
+                <set_value name="$vas_stm_comm_legs.{$vas_stm_cj}.$amount" exact="$vas_stm_comm_legs.{$vas_stm_cj}.$amount - $vas_stm_clean_leg.$amount"/>
+                <break/>
+              </do_if>
+            </do_all>
+            <set_value name="$vas_stm_total_volume" exact="[$vas_stm_total_volume - $vas_stm_clean_vol, 0].max"/>
+            <debug_to_file chance="@player.entity.$vas_stm_debug_chance" name="$vas_stm_debug_name" directory="'VAS_StationTraderMultiorder'"
+              text="'-drop underfilled %s x%s at %s (%s m3 lt floor %s).'.[$vas_stm_clean_leg.$offer.ware, $vas_stm_clean_leg.$amount, $vas_stm_clean_leg.$station.knownname, $vas_stm_clean_vol, $vas_stm_floor_vol]" append="true"/>
+          </do_else>
+        </do_all>
+
+        <!-- Surviving variable legs back to the owning list. -->
+        <do_if value="$vas_stm_mode == 'buy'">
+          <set_value name="$vas_stm_buy_legs" exact="$vas_stm_kept_legs"/>
+        </do_if>
+        <do_else>
+          <set_value name="$vas_stm_sell_legs" exact="$vas_stm_kept_legs"/>
+        </do_else>
+
+        <!-- Drop commander legs drained to zero. -->
+        <set_value name="$vas_stm_kept_comm" exact="[]"/>
+        <do_all exact="$vas_stm_comm_legs.count" counter="$vas_stm_cj">
+          <do_if value="$vas_stm_comm_legs.{$vas_stm_cj}.$amount gt 0">
+            <append_to_list name="$vas_stm_kept_comm" exact="$vas_stm_comm_legs.{$vas_stm_cj}"/>
+          </do_if>
+        </do_all>
+        <do_if value="$vas_stm_mode == 'buy'">
+          <set_value name="$vas_stm_sell_legs" exact="$vas_stm_kept_comm"/>
+        </do_if>
+        <do_else>
+          <set_value name="$vas_stm_buy_legs" exact="$vas_stm_kept_comm"/>
+        </do_else>
+
+        <!-- Recompute fill so the min-cargo gate sees the trimmed trip. -->
+        <set_value name="$vas_stm_cargo_pct" exact="0"/>
+        <do_if value="$vas_stm_cargo_capacity gt 0">
+          <set_value name="$vas_stm_cargo_pct" exact="($vas_stm_total_volume * 100) / $vas_stm_cargo_capacity"/>
+        </do_if>
+
+        <remove_value name="$vas_stm_floor_vol"/>
+        <remove_value name="$vas_stm_var_legs"/>
+        <remove_value name="$vas_stm_comm_legs"/>
+        <remove_value name="$vas_stm_kept_legs"/>
+        <remove_value name="$vas_stm_kept_comm"/>
+        <remove_value name="$vas_stm_clean_leg"/>
+        <remove_value name="$vas_stm_clean_vol"/>
+        <remove_value name="$vas_stm_ci"/>
+        <remove_value name="$vas_stm_cj"/>
+      </do_if>
+
+      <!-- ═══ Minimum cargo-fill gate (applies even with no extras) ═══
+           Build-storage supply is exempt and always runs. -->
+      <debug_to_file chance="@player.entity.$vas_stm_debug_chance" name="$vas_stm_debug_name" directory="'VAS_StationTraderMultiorder'"
+        text="'Trip: %s wares, %s/%s m3 (%s%%). Min %s%%. Extras %s.'.[$vas_stm_wares_this_trip, $vas_stm_total_volume, $vas_stm_cargo_capacity, $vas_stm_cargo_pct, player.entity.$vas_stm_min_cargo_pct, $vas_stm_extra_count]" append="true"/>
+
+      <do_if value="$vas_stm_cargo_pct lt player.entity.$vas_stm_min_cargo_pct and this.assignedcontrolled.assignment != assignment.tradeforbuildstorage">
+        <!-- Scale the back-off idle by the shortfall.
+             ADJUST HERE: linear ~ +5s per 10% short (shortfall * 0.5s).
+             Quadratic / logarithmic variants are worth testing. -->
+        <set_value name="$vas_stm_extra_idle" exact="[(player.entity.$vas_stm_min_cargo_pct - $vas_stm_cargo_pct) * 0.5, 0].max * 1s"/>
+        <debug_to_file chance="@player.entity.$vas_stm_debug_chance" name="$vas_stm_debug_name" directory="'VAS_StationTraderMultiorder'"
+          text="'%s%% below %s%% min. Skipping; extra idle %s.'.[$vas_stm_cargo_pct, player.entity.$vas_stm_min_cargo_pct, $vas_stm_extra_idle]" append="true"/>
+        <set_value name="$performsell" exact="false"/>
+        <set_value name="$performbuy" exact="false"/>
+        <set_value name="$vas_stm_sell_legs" exact="[]"/>
+        <set_value name="$vas_stm_buy_legs" exact="[]"/>
+      </do_if>
+
+      <!-- ═══ Route-sort the variable side ═══
+           Trade orders execute LIFO, so we build the desired visit route first,
+           then reverse it back into the leg list before order creation.
+           Sector choice is gate-distance based; station choice inside the chosen
+           sector is physical-distance based from the current route point.
+           All legs are pre-filtered for reachability at offer time, so
+           gatedistance here is always >= 0. -->
+      <do_if value="($vas_stm_mode == 'buy' and $vas_stm_buy_legs.count gt 1) or ($vas_stm_mode == 'sell' and $vas_stm_sell_legs.count gt 1)">
+        <set_value name="$vas_stm_route_unsorted" exact="if $vas_stm_mode == 'buy' then $vas_stm_buy_legs.clone else $vas_stm_sell_legs.clone"/>
+        <set_value name="$vas_stm_route_sorted" exact="[]"/>
+        <set_value name="$vas_stm_route_current" exact="if $vas_stm_mode == 'buy' then this.assignedcontrolled else $vas_stm_cmd"/>
+
+        <do_while value="$vas_stm_route_unsorted.count gt 0">
+          <set_value name="$vas_stm_route_best_sector" exact="$vas_stm_route_unsorted.{1}.$station.sector"/>
+          <set_value name="$vas_stm_route_best_sector_dist" exact="$vas_stm_route_current.gatedistance.{$vas_stm_route_unsorted.{1}.$station}"/>
+          <do_all exact="$vas_stm_route_unsorted.count" counter="$vas_stm_ri">
+            <set_value name="$vas_stm_route_leg" exact="$vas_stm_route_unsorted.{$vas_stm_ri}"/>
+            <set_value name="$vas_stm_route_dist" exact="$vas_stm_route_current.gatedistance.{$vas_stm_route_leg.$station}"/>
+            <do_if value="$vas_stm_route_dist lt $vas_stm_route_best_sector_dist">
+              <set_value name="$vas_stm_route_best_sector" exact="$vas_stm_route_leg.$station.sector"/>
+              <set_value name="$vas_stm_route_best_sector_dist" exact="$vas_stm_route_dist"/>
+            </do_if>
+          </do_all>
+
+          <do_while value="$vas_stm_route_unsorted.count gt 0">
+            <remove_value name="$vas_stm_route_pick"/>
+            <remove_value name="$vas_stm_route_pick_dist"/>
+            <do_all exact="$vas_stm_route_unsorted.count" counter="$vas_stm_ri">
+              <set_value name="$vas_stm_route_leg" exact="$vas_stm_route_unsorted.{$vas_stm_ri}"/>
+              <do_if value="$vas_stm_route_leg.$station.sector == $vas_stm_route_best_sector">
+                <set_value name="$vas_stm_route_dist" exact="$vas_stm_route_current.distanceto.{$vas_stm_route_leg.$station}"/>
+                <do_if value="not @$vas_stm_route_pick or $vas_stm_route_dist lt $vas_stm_route_pick_dist">
+                  <set_value name="$vas_stm_route_pick" exact="$vas_stm_route_leg"/>
+                  <set_value name="$vas_stm_route_pick_dist" exact="$vas_stm_route_dist"/>
+                </do_if>
+              </do_if>
+            </do_all>
+            <do_if value="@$vas_stm_route_pick">
+              <append_to_list name="$vas_stm_route_sorted" exact="$vas_stm_route_pick"/>
+              <set_value name="$vas_stm_route_current" exact="$vas_stm_route_pick.$station"/>
+              <remove_from_list name="$vas_stm_route_unsorted" exact="$vas_stm_route_pick"/>
+            </do_if>
+            <do_else>
+              <break/>
+            </do_else>
+          </do_while>
+        </do_while>
+
+        <set_value name="$vas_stm_route_reversed" exact="[]"/>
+        <do_all exact="$vas_stm_route_sorted.count" counter="$vas_stm_ri">
+          <append_to_list name="$vas_stm_route_reversed" exact="$vas_stm_route_sorted.{$vas_stm_route_sorted.count - $vas_stm_ri + 1}"/>
+        </do_all>
+        <do_if value="$vas_stm_mode == 'buy'">
+          <set_value name="$vas_stm_buy_legs" exact="$vas_stm_route_reversed"/>
+        </do_if>
+        <do_else>
+          <set_value name="$vas_stm_sell_legs" exact="$vas_stm_route_reversed"/>
+        </do_else>
+
+        <remove_value name="$vas_stm_route_unsorted"/>
+        <remove_value name="$vas_stm_route_sorted"/>
+        <remove_value name="$vas_stm_route_reversed"/>
+        <remove_value name="$vas_stm_route_current"/>
+        <remove_value name="$vas_stm_route_best_sector"/>
+        <remove_value name="$vas_stm_route_best_sector_dist"/>
+        <remove_value name="$vas_stm_route_leg"/>
+        <remove_value name="$vas_stm_route_dist"/>
+        <remove_value name="$vas_stm_route_pick"/>
+        <remove_value name="$vas_stm_route_pick_dist"/>
+      </do_if>
+
+      <remove_value name="$vas_stm_cmd"/>
+      <remove_value name="$vas_stm_mode"/>
+      <remove_value name="$vas_stm_cargo_capacity"/>
+      <remove_value name="$vas_stm_cargo_free"/>
+      <remove_value name="$vas_stm_remaining_volume"/>
+      <remove_value name="$vas_stm_total_volume"/>
+      <remove_value name="$vas_stm_wares_this_trip"/>
+      <remove_value name="$vas_stm_extra_count"/>
+      <remove_value name="$vas_stm_cargo_pct"/>
+      <remove_value name="$vas_stm_max_extra"/>
+      <remove_value name="$vas_stm_max_wares"/>
+      <remove_value name="$vas_stm_target"/>
+      <remove_value name="$vas_stm_min_leg_pct"/>
+      <remove_value name="$vas_stm_wstate"/>
+      <remove_value name="$vas_stm_used_pairs"/>
+      <remove_value name="$vas_stm_state"/>
+      <remove_value name="$vas_stm_cmd_leg"/>
+      <remove_value name="$vas_stm_primary_sell_leg"/>
+      <remove_value name="$vas_stm_primary_buy_leg"/>
+      <remove_value name="$vas_stm_new_ware"/>
+      <remove_value name="$vas_stm_pair_used"/>
+      <remove_value name="$vas_stm_wi"/>
+      <remove_value name="$vas_stm_pi"/>
+      <remove_value name="$vas_stm_ba"/>
+      <remove_value name="$vas_stm_sa"/>
+      <remove_value name="$vas_stm_legvol"/>
+      <remove_value name="$vas_stm_clamped"/>
+    </do_if>
+  </replace>
+
+  <!-- ──────────────────────────────────────────────────────────────
+       Injection 2 — emit every SELL leg (created BEFORE the buy legs, so
+       after the LIFO reversal all buys execute first, then all sells).
+       ────────────────────────────────────────────────────────────── -->
+  <replace sel="/aiscript/attention/actions/do_if[@value='$performsell']/create_trade_order[@name='$sellorder']">
+    <do_all exact="$vas_stm_sell_legs.count" counter="$vas_stm_li">
+      <create_trade_order object="this.object" tradeoffer="$vas_stm_sell_legs.{$vas_stm_li}.$offer" amount="$vas_stm_sell_legs.{$vas_stm_li}.$amount" immediate="true" internal="$vas_stm_sell_legs.{$vas_stm_li}.$internal"/>
+    </do_all>
+  </replace>
+
+  <!-- ──────────────────────────────────────────────────────────────
+       Injection 3 — emit every BUY leg, then drop the leg lists.
+       ────────────────────────────────────────────────────────────── -->
+  <replace sel="/aiscript/attention/actions/do_if[@value='$performbuy']/create_trade_order[@name='$buyorder']">
+    <do_all exact="$vas_stm_buy_legs.count" counter="$vas_stm_li">
+      <create_trade_order object="this.object" tradeoffer="$vas_stm_buy_legs.{$vas_stm_li}.$offer" amount="$vas_stm_buy_legs.{$vas_stm_li}.$amount" immediate="true" internal="$vas_stm_buy_legs.{$vas_stm_li}.$internal"/>
+    </do_all>
+    <remove_value name="$vas_stm_sell_legs"/>
+    <remove_value name="$vas_stm_buy_legs"/>
+  </replace>
+
+  <!-- ──────────────────────────────────────────────────────────────
+       Injection 4 — extend the idle wait at the "prep" label by the
+       back-off computed on a skipped run. Rides vanilla's $idleduration
+       (consumed by the move.idle call right after).
+       ────────────────────────────────────────────────────────────── -->
+  <replace sel="/aiscript/attention/actions/remove_value[@name='$forcelongidle']">
+    <remove_value name="$forcelongidle"/>
+    <do_if value="@$vas_stm_extra_idle">
+      <set_value name="$idleduration" exact="$idleduration + $vas_stm_extra_idle"/>
+      <remove_value name="$vas_stm_extra_idle"/>
+    </do_if>
+  </replace>
+</diff>

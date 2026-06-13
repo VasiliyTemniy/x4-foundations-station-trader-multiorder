@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<diff><add sel="/language">
+  <page id="202606061" title="[VAS] Station Trader Multi-Order" descr="0" voice="no">
+    <t id="1">Station Trader Multi-Order</t>
+    <t id="2">Enable for traders</t>
+    <t id="3">Max wares per trip</t>
+    <t id="4">Min cargo usage</t>
+    <t id="5">Max extra trades</t>
+    <t id="6">Debug logging</t>
+    <t id="7">Enable for build storage traders</t>
+    <t id="8">Extra-trade target fill</t>
+    <t id="9">Per-extra minimum fill</t>
+    <t id="10">Enable for player owned ships</t>
+    <t id="11">Enable for NPC owned ships</t>
+    <t id="12">Drop underfilled vanilla order</t>
+  </page>
+</add></diff>
