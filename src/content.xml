@@ -4,7 +4,7 @@
   name="[VAS] Station Trader Multi-Order"
   description="Station traders fill the rest of their hold with other wares their station needs or sells on the same round trip - sourced from or delivered to as many stations as needed - while respecting your trade rules, blacklists and station trade restrictions. Includes a configurable minimum cargo-fill threshold."
   author="VasiliyTemniy"
-  version="100"
+  version="101"
   date="2026-06-12"
   save="0">
   <dependency id="ws_2042901274" optional="false" name="SirNukes Mod Support APIs"/>

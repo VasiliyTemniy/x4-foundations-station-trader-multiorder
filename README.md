@@ -42,6 +42,11 @@ It runs automatically for station-trader subordinates — there are no menu
 actions. Everything is tuned from Extension Options, and turning it off restores
 exactly vanilla behaviour.
 
+Works for every cargo bay type: container freighters, solid haulers (mineral
+miners), and liquid haulers (gas miners — the gases are liquid-transport wares).
+A mineral or gas miner assigned to *Trade for Commander* tops up and multi-drops
+on its own bay just like a freighter does.
+
 ## Options (Extensions → Mod Options → Station Trader Multi-Order)
 
 | Option | Default | What it does |

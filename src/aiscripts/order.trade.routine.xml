@@ -101,14 +101,21 @@
         <set_value name="$vas_stm_mode" exact="'sell'"/>
       </do_elseif>
 
-      <!-- Cargo budget -->
-      <set_value name="$vas_stm_cargo_capacity" exact="this.assignedcontrolled.cargo.capacity.container"/>
-      <do_if value="not $vas_stm_cargo_capacity">
-        <set_value name="$vas_stm_cargo_capacity" exact="this.assignedcontrolled.cargo.capacity.universal"/>
-      </do_if>
-      <set_value name="$vas_stm_cargo_free" exact="this.assignedcontrolled.cargo.free.container"/>
-      <do_if value="not $vas_stm_cargo_free">
-        <set_value name="$vas_stm_cargo_free" exact="this.assignedcontrolled.cargo.free.universal"/>
+      <!-- Cargo budget, keyed off the traded ware's transport type so non-container
+           haulers report their real bay instead of zero: mineral miners use the solid
+           bay, gas miners and other liquid carriers use the liquid bay (gases are
+           liquid-transport wares), box freighters use container. A universal bay also
+           holds container/solid/liquid, so fold it in for those; condensate (Protectyon)
+           has no universal overlap and stands alone. Indexing cargo.capacity/free by a
+           transport tag is the documented vanilla pattern (e.g. md/notifications.xml).
+           Per-leg sizing still uses cargo.{ware}.free below; this is only the trip-level
+           capacity/fill the min-cargo gate reads. -->
+      <set_value name="$vas_stm_cargo_tag" exact="$selloffer.ware.transporttag"/>
+      <set_value name="$vas_stm_cargo_capacity" exact="this.assignedcontrolled.cargo.capacity.{$vas_stm_cargo_tag}"/>
+      <set_value name="$vas_stm_cargo_free" exact="this.assignedcontrolled.cargo.free.{$vas_stm_cargo_tag}"/>
+      <do_if value="$selloffer.ware.waretransport != waretransport.condensate">
+        <set_value name="$vas_stm_cargo_capacity" exact="$vas_stm_cargo_capacity + this.assignedcontrolled.cargo.capacity.universal"/>
+        <set_value name="$vas_stm_cargo_free" exact="$vas_stm_cargo_free + this.assignedcontrolled.cargo.free.universal"/>
       </do_if>
       <set_value name="$vas_stm_remaining_volume" exact="[$vas_stm_cargo_free, $vas_stm_cargo_capacity].min"/>
       <set_value name="$vas_stm_total_volume" exact="$buyamount * $selloffer.ware.volume"/>
@@ -565,6 +572,7 @@
 
       <remove_value name="$vas_stm_cmd"/>
       <remove_value name="$vas_stm_mode"/>
+      <remove_value name="$vas_stm_cargo_tag"/>
       <remove_value name="$vas_stm_cargo_capacity"/>
       <remove_value name="$vas_stm_cargo_free"/>
       <remove_value name="$vas_stm_remaining_volume"/>
